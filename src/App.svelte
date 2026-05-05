@@ -1,6 +1,10 @@
 <script lang="ts">
 	import CellWaveFluid, {
 		DEFAULT_NOISE_LAYERS,
+		VERT_SOURCE,
+		INIT_FRAG_SOURCE,
+		UPDATE_FRAG_SOURCE,
+		RENDER_FRAG_SOURCE,
 		type ColorStop,
 		type NoiseLayer,
 		type Occluder,
@@ -215,72 +219,56 @@
 		selectedStop = colorStops.length - 1;
 	}
 
-	// ---- Code-tab faithful exporter ----
-	function fmtStops(stops: ColorStop[]): string {
-		return '[\n' + stops.map((s) => `    { offset: ${s.offset}, color: '${s.color}' }`).join(',\n') + '\n  ]';
-	}
-	function fmtLayers(layers: NoiseLayer[]): string {
-		return '[\n' + layers.map((l) => {
-			const parts = [
-				`scale: ${l.scale}`,
-				`strength: ${l.strength}`,
-				`speed: ${l.speed}`,
-				`enabled: ${l.enabled}`,
-				`pattern: '${l.pattern}'`
-			];
-			if (l.angle !== undefined) parts.push(`angle: ${l.angle}`);
-			return `    { ${parts.join(', ')} }`;
-		}).join(',\n') + '\n  ]';
-	}
-	const sO = '<' + 'script lang="ts">';
-	const sC = '</' + 'script>';
+	// ---- Code-tab — algorithm view-source ----
 	function num(n: number): string {
-		// Drop float dust, keep integers integer.
 		const r = Math.round(n * 1e4) / 1e4;
 		return Number.isInteger(r) ? String(r) : r.toString();
 	}
-	function fmtOccluder(o: Occluder): string {
-		return `    { x0: ${num(o.x0)}, y0: ${num(o.y0)}, x1: ${num(o.x1)}, y1: ${num(o.y1)} }`;
+	function dedent(s: string): string {
+		const lines = s.replace(/^\n+|\n+$/g, '').split('\n');
+		const min = lines.filter((l) => l.trim()).reduce((m, l) => Math.min(m, l.match(/^\s*/)![0].length), Infinity);
+		return lines.map((l) => l.slice(min)).join('\n');
 	}
-	function fmtCurrent(c: Current): string {
-		return `    { startX: ${num(c.startX)}, startY: ${num(c.startY)}, endX: ${num(c.endX)}, endY: ${num(c.endY)}, width: ${num(c.width)}, strength: ${num(c.strength)}, speed: ${num(c.speed)}, taper: ${num(c.taper)} }`;
-	}
-	function fmtEmitter(e: Emitter): string {
-		return `    { x: ${num(e.x)}, y: ${num(e.y)}, angle: ${num(e.angle)}, length: ${num(e.length)}, spread: ${num(e.spread)}, strength: ${num(e.strength)}, speed: ${num(e.speed)}, taper: ${num(e.taper)} }`;
-	}
-	function fmtList<T>(name: string, arr: T[], formatter: (item: T) => string): string {
-		return `${name}={[\n${arr.map(formatter).join(',\n')}\n  ]}`;
-	}
-	const stopsChanged = $derived(JSON.stringify(colorStops) !== JSON.stringify(D.colorStops));
-	const layersChanged = $derived(JSON.stringify(noiseLayers) !== JSON.stringify(D.noiseLayers));
 	const usage = $derived.by(() => {
-		const lines: string[] = [];
-		if (gridSize !== D.gridSize) lines.push(`    gridSize={${gridSize}}`);
-		if (advection !== D.advection) lines.push(`    advection={${advection}}`);
-		if (diffusion !== D.diffusion) lines.push(`    diffusion={${diffusion}}`);
-		if (visScale !== D.visScale) lines.push(`    visScale={${visScale}}`);
-		if (speed !== D.speed) lines.push(`    speed={${speed}}`);
-		if (gradientCurve !== D.gradientCurve) lines.push(`    gradientCurve={${gradientCurve}}`);
-		if (gradientContrast !== D.gradientContrast) lines.push(`    gradientContrast={${gradientContrast}}`);
-		if (tintAmount !== D.tintAmount) lines.push(`    tintAmount={${tintAmount}}`);
-		if (tintSaturation !== D.tintSaturation) lines.push(`    tintSaturation={${tintSaturation}}`);
-		if (tintLightness !== D.tintLightness) lines.push(`    tintLightness={${tintLightness}}`);
-		if (tintHueOffset !== D.tintHueOffset) lines.push(`    tintHueOffset={${tintHueOffset}}`);
-		if (tintHueRange !== D.tintHueRange) lines.push(`    tintHueRange={${tintHueRange}}`);
-		if (backgroundColor !== D.backgroundColor) lines.push(`    backgroundColor="${backgroundColor}"`);
-		if (stopsChanged) lines.push(`    colorStops={${fmtStops(colorStops)}}`);
-		if (layersChanged) lines.push(`    noiseLayers={${fmtLayers(noiseLayers)}}`);
-		if (occluders.length) lines.push('    ' + fmtList('occluders', occluders, fmtOccluder));
-		if (currents.length) lines.push('    ' + fmtList('currents', currents, fmtCurrent));
-		if (emitters.length) lines.push('    ' + fmtList('emitters', emitters, fmtEmitter));
-		const body = lines.length ? '\n' + lines.join('\n') + '\n  ' : ' ';
-		return `${sO}
-  import CellWaveFluid from './CellWaveFluid.svelte';
-${sC}
+		const params = {
+			gridSize, advection, diffusion, visScale, speed,
+			gradientCurve, gradientContrast,
+			tintAmount, tintSaturation, tintLightness, tintHueOffset, tintHueRange,
+			backgroundColor,
+			colorStops, noiseLayers, currents, emitters, occluders
+		};
+		const fmtParams = JSON.stringify(params, (_k, v) => typeof v === 'number' ? +num(v) : v, 2);
+		return `// CellWave Fluid — algorithm snapshot
+// Generated from cellwaveGPU · github.com/newjordan/cellwaveGPU
+//
+// What follows is the actual GPU pipeline running on screen right now,
+// plus the parameters you've dialed in. Each frame, the update shader
+// writes a new velocity field into a ping-pong RGBA16F texture
+// (advection + diffusion + forcing layers + currents + emitters,
+// then occluders zero out blocked cells). The render shader then
+// samples speed, runs it through a tone curve and color LUT, and
+// optionally blends in a directional hue tint.
 
-<div style="position: relative; width: 100%; height: 600px;">
-  <CellWaveFluid${body}/>
-</div>`;
+// ─── Your parameters ─────────────────────────────────────────────
+const params = ${fmtParams};
+
+// ─── Vertex shader (fullscreen triangle) ─────────────────────────
+const VERT = \`${dedent(VERT_SOURCE)}\`;
+
+// ─── Init shader (seeds the velocity field with random noise) ────
+const INIT_FRAG = \`${dedent(INIT_FRAG_SOURCE)}\`;
+
+// ─── Update shader (the simulation step) ─────────────────────────
+// advection: semi-Lagrangian back-trace
+// diffusion: 4-neighbor (von Neumann) Laplacian
+// forcing:   layered 3D simplex noise (Ashima/Stefan Gustavson) + sin waves
+// currents:  directional force tubes between two points
+// emitters:  cone-shaped fans from a point along an angle
+// occluders: rect blocks that zero out velocity (applied last)
+const UPDATE_FRAG = \`${dedent(UPDATE_FRAG_SOURCE)}\`;
+
+// ─── Render shader (velocity → speed → tone → color → tint) ──────
+const RENDER_FRAG = \`${dedent(RENDER_FRAG_SOURCE)}\`;`;
 	});
 
 	let copied = $state(false);
