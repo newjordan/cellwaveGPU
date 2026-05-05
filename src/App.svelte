@@ -21,6 +21,129 @@
 		{ offset: 1, color: '#ffffff' }
 	];
 
+	type Preset = { name: string; stops: ColorStop[] };
+	const PRESETS: Preset[] = [
+		{
+			name: 'Mono',
+			stops: [
+				{ offset: 0, color: '#000000' },
+				{ offset: 0.5, color: '#808080' },
+				{ offset: 1, color: '#ffffff' }
+			]
+		},
+		{
+			name: 'Quasar',
+			stops: [
+				{ offset: 0, color: '#000000' },
+				{ offset: 0.18, color: '#ffeb3b' },
+				{ offset: 0.34, color: '#ff1744' },
+				{ offset: 0.52, color: '#ec00d2' },
+				{ offset: 0.7, color: '#00e5ff' },
+				{ offset: 0.85, color: '#76ff03' },
+				{ offset: 1, color: '#2962ff' }
+			]
+		},
+		{
+			name: 'Lovable',
+			stops: [
+				{ offset: 0, color: '#0a0e2c' },
+				{ offset: 0.45, color: '#ff3b6f' },
+				{ offset: 0.78, color: '#ff7eb6' },
+				{ offset: 1, color: '#1e3a8a' }
+			]
+		},
+		{
+			name: 'Bloom',
+			stops: [
+				{ offset: 0, color: '#1a0a1f' },
+				{ offset: 0.45, color: '#ffd1e8' },
+				{ offset: 1, color: '#a78bfa' }
+			]
+		},
+		{
+			name: 'Sunset',
+			stops: [
+				{ offset: 0, color: '#220011' },
+				{ offset: 0.4, color: '#ff5500' },
+				{ offset: 0.75, color: '#ff80a0' },
+				{ offset: 1, color: '#ff00aa' }
+			]
+		},
+		{
+			name: 'Chrome',
+			stops: [
+				{ offset: 0, color: '#0a0820' },
+				{ offset: 0.35, color: '#0066ff' },
+				{ offset: 0.65, color: '#00e5ff' },
+				{ offset: 0.85, color: '#ffe1c4' },
+				{ offset: 1, color: '#ff8800' }
+			]
+		},
+		{
+			name: 'Spectrum',
+			stops: [
+				{ offset: 0, color: '#000000' },
+				{ offset: 0.16, color: '#aa00ff' },
+				{ offset: 0.32, color: '#0088ff' },
+				{ offset: 0.48, color: '#00ffaa' },
+				{ offset: 0.64, color: '#ffff00' },
+				{ offset: 0.82, color: '#ff8800' },
+				{ offset: 1, color: '#ff0044' }
+			]
+		},
+		{
+			name: 'Aurora',
+			stops: [
+				{ offset: 0, color: '#0a0e2c' },
+				{ offset: 0.32, color: '#3b0d5e' },
+				{ offset: 0.6, color: '#e91e63' },
+				{ offset: 0.85, color: '#ff5722' },
+				{ offset: 1, color: '#ffeb3b' }
+			]
+		},
+		{
+			name: 'Cyber',
+			stops: [
+				{ offset: 0, color: '#000022' },
+				{ offset: 0.28, color: '#00ffaa' },
+				{ offset: 0.5, color: '#00aaff' },
+				{ offset: 0.75, color: '#ff00ff' },
+				{ offset: 1, color: '#ffff00' }
+			]
+		},
+		{
+			name: 'Surge',
+			stops: [
+				{ offset: 0, color: '#1a0033' },
+				{ offset: 0.32, color: '#ff5500' },
+				{ offset: 0.55, color: '#ff0099' },
+				{ offset: 0.8, color: '#3300ff' },
+				{ offset: 1, color: '#ffaa00' }
+			]
+		},
+		{
+			name: 'Prism',
+			stops: [
+				{ offset: 0, color: '#000000' },
+				{ offset: 0.2, color: '#ff0080' },
+				{ offset: 0.4, color: '#ffaa00' },
+				{ offset: 0.6, color: '#00e5ff' },
+				{ offset: 0.8, color: '#aa66ff' },
+				{ offset: 1, color: '#ffffff' }
+			]
+		}
+	];
+
+	function applyPreset(p: Preset) {
+		colorStops = p.stops.map((s) => ({ ...s }));
+		selectedStop = 0;
+	}
+	function presetCss(stops: ColorStop[]): string {
+		return 'linear-gradient(to right, ' +
+			stops.map((s) => `${s.color} ${(s.offset * 100).toFixed(2)}%`).join(', ') +
+			')';
+	}
+
 	const D = {
 		gridSize: 90,
 		advection: 0.15,
@@ -347,6 +470,21 @@ const RENDER_FRAG = \`${dedent(RENDER_FRAG_SOURCE)}\`;`;
 				<label for="r-vis">Vis Scale</label>
 				<input id="r-vis" type="range" min="0.1" max="5" step="0.05" bind:value={visScale} />
 				<span class="value">{visScale.toFixed(2)}</span>
+			</div>
+
+			<div class="row-full section">Presets</div>
+			<div class="presets row-full">
+				{#each PRESETS as p (p.name)}
+					<button
+						type="button"
+						class="preset"
+						onclick={() => applyPreset(p)}
+						style:background={presetCss(p.stops)}
+						aria-label={`Apply ${p.name} gradient`}
+					>
+						<span class="preset-name">{p.name}</span>
+					</button>
+				{/each}
 			</div>
 
 			<div class="row-full section">Color &amp; Gradient</div>

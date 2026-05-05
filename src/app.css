@@ -237,6 +237,38 @@ select {
 .switch input:checked ~ .track { background: var(--accent); }
 .switch input:checked ~ .knob { transform: translateX(14px); background: #0a0a0c; }
 
+/* ---- presets grid ---- */
+.presets {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+	gap: 8px;
+}
+.preset {
+	position: relative;
+	height: 56px;
+	border-radius: 8px;
+	border: 1px solid var(--border-strong);
+	cursor: pointer;
+	overflow: hidden;
+	padding: 0;
+	transition: transform 0.12s ease, border-color 0.12s ease;
+}
+.preset:hover {
+	transform: translateY(-1px);
+	border-color: var(--accent);
+}
+.preset-name {
+	position: absolute;
+	bottom: 4px;
+	left: 8px;
+	font-size: 11px;
+	color: white;
+	text-shadow: 0 1px 3px rgba(0, 0, 0, 0.85), 0 0 6px rgba(0, 0, 0, 0.5);
+	font-weight: 600;
+	letter-spacing: 0.02em;
+	pointer-events: none;
+}
+
 /* ---- gradient bar ---- */
 .grad-row {
 	grid-column: 1 / -1;
