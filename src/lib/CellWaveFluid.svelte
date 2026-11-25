@@ -1,6 +1,4 @@
 <script lang="ts" module>
-	// GPU_STAGE: polish-done
-
 	export const VERT_SOURCE = `
 			attribute vec2 position;
 			varying vec2 vUv;
@@ -376,6 +374,8 @@
 		gradientContrast?: number;
 		speed?: number;
 		backgroundColor?: string;
+		paused?: boolean;
+		onUnavailable?: () => void;
 		class?: string;
 	};
 
@@ -398,10 +398,12 @@
 		gradientContrast = 0.66,
 		speed = 0.45,
 		backgroundColor = '#000000',
+		paused = false,
+		onUnavailable,
 		class: className = ''
 	}: Props = $props();
 
-	let containerRef: HTMLDivElement;
+	let containerRef: HTMLDivElement | undefined;
 
 	type GpuRefs = {
 		renderer: Renderer;
@@ -433,21 +435,57 @@
 	});
 
 	onMount(() => {
-		const renderer = new Renderer({
-			webgl: 2,
+		const fail = () => {
+			queueMicrotask(() => onUnavailable?.());
+		};
+		const container = containerRef;
+		if (!container) {
+			fail();
+			return;
+		}
+
+		// Probe before OGL constructs a renderer. OGL throws if both WebGL2
+		// and WebGL1 context creation fail, and RGBA16F targets need
+		// EXT_color_buffer_float or the simulation renders a blank canvas.
+		const probe = document.createElement('canvas');
+		const probeGl = probe.getContext('webgl2', {
 			alpha: true,
 			depth: false,
 			stencil: false,
 			antialias: false,
-			dpr: Math.min(window.devicePixelRatio || 1, 2),
 			powerPreference: 'high-performance'
 		});
+		const canRenderFloat = !!probeGl?.getExtension('EXT_color_buffer_float');
+		probeGl?.getExtension('WEBGL_lose_context')?.loseContext();
+		if (!probeGl || !canRenderFloat) {
+			fail();
+			return;
+		}
+
+		let renderer: Renderer;
+		try {
+			renderer = new Renderer({
+				webgl: 2,
+				alpha: true,
+				depth: false,
+				stencil: false,
+				antialias: false,
+				preserveDrawingBuffer: true,
+				dpr: Math.min(window.devicePixelRatio || 1, 2),
+				powerPreference: 'high-performance'
+			});
+		} catch (error) {
+			console.error('CellWave renderer failed to start', error);
+			fail();
+			return;
+		}
+
 		const gl = renderer.gl;
+		if (!gl || !(gl instanceof WebGL2RenderingContext)) {
+			fail();
+			return;
+		}
 		gl.clearColor(0, 0, 0, 0);
-		// OGL's Renderer canvas is always an HTMLCanvasElement; the union
-		// in the WebGL2RenderingContext.canvas type forces this assertion.
-		// eslint-disable-next-line svelte/no-dom-manipulating
-		containerRef.appendChild(gl.canvas as HTMLCanvasElement);
 
 		// WebGL2-only enum values not in the WebGL1 union OGL types its gl as.
 		const GL_HALF_FLOAT = 0x140b;
@@ -475,6 +513,21 @@
 		};
 		const velA = new RenderTarget(gl, rtOpts);
 		const velB = new RenderTarget(gl, rtOpts);
+		const floatTargetsReady = [velA, velB].every((target) => {
+			renderer.bindFramebuffer(target);
+			return gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+		});
+		renderer.bindFramebuffer();
+		if (!floatTargetsReady) {
+			gl.getExtension('WEBGL_lose_context')?.loseContext();
+			fail();
+			return;
+		}
+
+		const canvas = gl.canvas as HTMLCanvasElement;
+		canvas.setAttribute('aria-hidden', 'true');
+		// eslint-disable-next-line svelte/no-dom-manipulating
+		container.appendChild(canvas);
 
 		// Color LUT as 256x1 RGB texture, linear-filtered for smooth gradient sampling.
 		const colorLutTex = new Texture(gl, {
@@ -698,17 +751,17 @@
 		};
 
 		const resize = () => {
-			const { width, height } = containerRef.getBoundingClientRect();
+			const { width, height } = container.getBoundingClientRect();
 			renderer.setSize(width, height);
 		};
 		const ro = new ResizeObserver(resize);
-		ro.observe(containerRef);
+		ro.observe(container);
 		resize();
 
 		let raf = 0;
 		let visible = true;
 		const tick = () => {
-			if (visible && !document.hidden) {
+			if (visible && !document.hidden && !paused) {
 				noiseTime += 0.005 * speed;
 				packLayers(noiseLayers, noiseTime);
 				updateProgram.uniforms.uOccluderCount.value = packOccluders(occluders);
@@ -736,7 +789,7 @@
 			(entries) => { for (const e of entries) visible = e.isIntersecting; },
 			{ rootMargin: '100px' }
 		);
-		io.observe(containerRef);
+		io.observe(container);
 
 		raf = requestAnimationFrame(tick);
 		gpu = { renderer, colorLutTex, hueLutTex, setGridSize };
@@ -756,6 +809,8 @@
 	bind:this={containerRef}
 	class="cwf-root {className}"
 	style:background-color={backgroundColor}
+	role="img"
+	aria-label={paused ? 'Paused CellWave fluid preview' : 'Animated CellWave fluid preview'}
 ></div>
 
 <style>
