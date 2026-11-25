@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import CellWaveFluid, {
 		DEFAULT_NOISE_LAYERS,
 		VERT_SOURCE,
@@ -11,6 +12,7 @@
 		type Current,
 		type Emitter
 	} from './lib/CellWaveFluid.svelte';
+	import { detectWebGPU } from './lib/gpuSupport';
 
 	const cloneLayers = (): NoiseLayer[] => DEFAULT_NOISE_LAYERS.map((l) => ({ ...l }));
 	const cloneStops = (s: ColorStop[]): ColorStop[] => s.map((x) => ({ ...x }));
@@ -134,14 +136,25 @@
 		}
 	];
 
+	function sameStops(a: ColorStop[], b: ColorStop[]): boolean {
+		if (a.length !== b.length) return false;
+		const as = [...a].sort((x, y) => x.offset - y.offset);
+		const bs = [...b].sort((x, y) => x.offset - y.offset);
+		return as.every(
+			(stop, i) => stop.offset === bs[i].offset && stop.color.toLowerCase() === bs[i].color.toLowerCase()
+		);
+	}
+
 	function applyPreset(p: Preset) {
 		colorStops = p.stops.map((s) => ({ ...s }));
 		selectedStop = 0;
 	}
 	function presetCss(stops: ColorStop[]): string {
-		return 'linear-gradient(to right, ' +
+		return (
+			'linear-gradient(to right, ' +
 			stops.map((s) => `${s.color} ${(s.offset * 100).toFixed(2)}%`).join(', ') +
-			')';
+			')'
+		);
 	}
 
 	const D = {
@@ -165,6 +178,12 @@
 		emitters: [] as Emitter[]
 	};
 
+	type WithId<T> = T & { id: string };
+	type CurrentControl = WithId<Current>;
+	type EmitterControl = WithId<Emitter>;
+	type OccluderControl = WithId<Occluder>;
+	type TabId = 'controls' | 'code';
+
 	let gridSize = $state(D.gridSize);
 	let advection = $state(D.advection);
 	let diffusion = $state(D.diffusion);
@@ -180,10 +199,24 @@
 	let gradientContrast = $state(D.gradientContrast);
 	let colorStops = $state<ColorStop[]>(cloneStops(DEFAULT_STOPS));
 	let noiseLayers = $state<NoiseLayer[]>(cloneLayers());
-	let occluders = $state<Occluder[]>([]);
-	let currents = $state<Current[]>([]);
-	let emitters = $state<Emitter[]>([]);
-	let activeTab = $state<'controls' | 'code'>('controls');
+	let occluders = $state<OccluderControl[]>([]);
+	let currents = $state<CurrentControl[]>([]);
+	let emitters = $state<EmitterControl[]>([]);
+	let activeTab = $state<TabId>('controls');
+	let selectedStop = $state(0);
+	let paused = $state(false);
+	let prefersReducedMotion = $state(false);
+	let webgpuSupported = $state<boolean | null>(null);
+	let gpuBlocked = $state(false);
+
+	let forceSerial = 1;
+	function nextId(prefix: string) {
+		forceSerial += 1;
+		return `${prefix}-${forceSerial}`;
+	}
+	function withoutId<T extends { id: string }>(items: T[]): Omit<T, 'id'>[] {
+		return items.map(({ id: _id, ...rest }) => rest);
+	}
 
 	function reset() {
 		gridSize = D.gridSize;
@@ -204,14 +237,15 @@
 		occluders = [];
 		currents = [];
 		emitters = [];
+		selectedStop = 0;
 	}
 
-	// ---- Forces helpers ----
 	const MAX_FORCES = 8;
 	function addCurrent() {
 		if (currents.length >= MAX_FORCES) return;
 		const g = gridSize;
 		currents.push({
+			id: nextId('current'),
 			startX: g * (0.2 + Math.random() * 0.2),
 			startY: g * (0.4 + Math.random() * 0.2),
 			endX: g * (0.6 + Math.random() * 0.2),
@@ -226,6 +260,7 @@
 		if (emitters.length >= MAX_FORCES) return;
 		const g = gridSize;
 		emitters.push({
+			id: nextId('emitter'),
 			x: g * (0.3 + Math.random() * 0.4),
 			y: g * (0.3 + Math.random() * 0.4),
 			angle: Math.random() * 360,
@@ -242,11 +277,21 @@
 		const x0 = Math.floor(Math.random() * (g - 20));
 		const y0 = Math.floor(Math.random() * (g - 20));
 		occluders.push({
+			id: nextId('occluder'),
 			x0,
 			y0,
 			x1: x0 + 5 + Math.floor(Math.random() * 12),
 			y1: y0 + 5 + Math.floor(Math.random() * 12)
 		});
+	}
+	function removeCurrent(id: string) {
+		currents = currents.filter((item) => item.id !== id);
+	}
+	function removeEmitter(id: string) {
+		emitters = emitters.filter((item) => item.id !== id);
+	}
+	function removeOccluder(id: string) {
+		occluders = occluders.filter((item) => item.id !== id);
 	}
 	function setCurrent<K extends keyof Current>(i: number, key: K, v: Current[K]) {
 		currents[i][key] = v;
@@ -258,26 +303,25 @@
 		occluders[i][key] = v;
 	}
 
-	// ---- Layer helpers ----
 	function setLayer<K extends keyof NoiseLayer>(i: number, key: K, value: NoiseLayer[K]) {
 		noiseLayers[i][key] = value;
 	}
-	function setStopColor(i: number, color: string) { colorStops[i].color = color; }
+	function setStopColor(i: number, color: string) {
+		colorStops[i].color = color;
+	}
 	function setStopOffset(i: number, offset: number) {
 		colorStops[i].offset = Math.max(0, Math.min(1, offset));
 	}
 	function removeStop(i: number) {
 		if (colorStops.length <= 2) return;
 		colorStops.splice(i, 1);
-		if (selectedStop >= colorStops.length) selectedStop = colorStops.length - 1;
+		if (selectedStop > i) selectedStop -= 1;
+		else if (selectedStop >= colorStops.length) selectedStop = colorStops.length - 1;
 	}
 
-	// ---- Gradient bar editor ----
 	const MAX_STOPS = 8;
 	let barEl: HTMLDivElement | null = $state(null);
 	let dragIdx = $state(-1);
-	let dragMoved = $state(false);
-	let selectedStop = $state(0);
 
 	const sortedStops = $derived(
 		[...colorStops].map((s, i) => ({ s, i })).sort((a, b) => a.s.offset - b.s.offset)
@@ -287,62 +331,105 @@
 			sortedStops.map(({ s }) => `${s.color} ${(s.offset * 100).toFixed(2)}%`).join(', ') +
 			')'
 	);
+	const activePreset = $derived(PRESETS.find((preset) => sameStops(preset.stops, colorStops))?.name ?? null);
 
 	function offsetFromX(clientX: number): number {
 		if (!barEl) return 0;
 		const rect = barEl.getBoundingClientRect();
+		if (rect.width <= 0) return 0;
 		return Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+	}
+
+	function mixHex(aHex: string, bHex: string, t: number): string {
+		const a = Number.parseInt(aHex.slice(1), 16);
+		const b = Number.parseInt(bHex.slice(1), 16);
+		if (Number.isNaN(a) || Number.isNaN(b)) return aHex;
+		const ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
+		const br = (b >> 16) & 255, bg = (b >> 8) & 255, bb = b & 255;
+		const mr = (ar + (br - ar) * t) | 0;
+		const mg = (ag + (bg - ag) * t) | 0;
+		const mb = (ab + (bb - ab) * t) | 0;
+		return '#' + ((mr << 16) | (mg << 8) | mb).toString(16).padStart(6, '0');
+	}
+	function interpolateStopColor(offset: number): string {
+		const sorted = [...colorStops].sort((a, b) => a.offset - b.offset);
+		if (!sorted.length) return '#ffffff';
+		if (offset <= sorted[0].offset) return sorted[0].color;
+		const last = sorted[sorted.length - 1];
+		if (offset >= last.offset) return last.color;
+		for (let i = 0; i < sorted.length - 1; i++) {
+			if (offset >= sorted[i].offset && offset <= sorted[i + 1].offset) {
+				const span = sorted[i + 1].offset - sorted[i].offset;
+				const t = span > 0 ? (offset - sorted[i].offset) / span : 0;
+				return mixHex(sorted[i].color, sorted[i + 1].color, t);
+			}
+		}
+		return last.color;
+	}
+	function addStopAt(offset: number) {
+		if (colorStops.length >= MAX_STOPS) return;
+		const clamped = Math.max(0, Math.min(1, offset));
+		colorStops.push({ offset: clamped, color: interpolateStopColor(clamped) });
+		selectedStop = colorStops.length - 1;
+	}
+	function addStopInLargestGap() {
+		const sorted = [...colorStops].sort((a, b) => a.offset - b.offset);
+		let best = 0.5;
+		let gap = -1;
+		for (let i = 0; i < sorted.length - 1; i++) {
+			const size = sorted[i + 1].offset - sorted[i].offset;
+			if (size > gap) {
+				gap = size;
+				best = (sorted[i].offset + sorted[i + 1].offset) / 2;
+			}
+		}
+		addStopAt(best);
 	}
 
 	function onHandlePointerDown(e: PointerEvent, idx: number) {
 		e.stopPropagation();
 		dragIdx = idx;
-		dragMoved = false;
+		selectedStop = idx;
 		(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
 	}
 	function onHandlePointerMove(e: PointerEvent, idx: number) {
 		if (dragIdx !== idx) return;
-		dragMoved = true;
 		setStopOffset(idx, offsetFromX(e.clientX));
 	}
 	function onHandlePointerUp(e: PointerEvent, idx: number) {
 		if (dragIdx !== idx) return;
-		const moved = dragMoved;
 		dragIdx = -1;
-		dragMoved = false;
-		(e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-		if (!moved) selectedStop = idx;
+		const handle = e.currentTarget as HTMLElement;
+		if (handle.hasPointerCapture?.(e.pointerId)) handle.releasePointerCapture(e.pointerId);
 	}
 	function onHandleDoubleClick(e: MouseEvent, idx: number) {
 		e.stopPropagation();
+		e.preventDefault();
 		removeStop(idx);
 	}
-	function onBarClick(e: MouseEvent) {
-		if (colorStops.length >= MAX_STOPS) return;
-		const offset = offsetFromX(e.clientX);
-		const sorted = [...colorStops].sort((a, b) => a.offset - b.offset);
-		let color = sorted[sorted.length - 1].color;
-		for (let i = 0; i < sorted.length - 1; i++) {
-			if (offset >= sorted[i].offset && offset <= sorted[i + 1].offset) {
-				const span = sorted[i + 1].offset - sorted[i].offset;
-				const t = span > 0 ? (offset - sorted[i].offset) / span : 0;
-				const a = parseInt(sorted[i].color.slice(1), 16);
-				const b = parseInt(sorted[i + 1].color.slice(1), 16);
-				const ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
-				const br = (b >> 16) & 255, bg = (b >> 8) & 255, bb = b & 255;
-				const mr = (ar + (br - ar) * t) | 0;
-				const mg = (ag + (bg - ag) * t) | 0;
-				const mb = (ab + (bb - ab) * t) | 0;
-				color = '#' + ((mr << 16) | (mg << 8) | mb).toString(16).padStart(6, '0');
-				break;
-			}
-			if (offset < sorted[0].offset) { color = sorted[0].color; break; }
+	function onHandleKeydown(e: KeyboardEvent, idx: number) {
+		const step = e.shiftKey ? 0.1 : 0.01;
+		if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+			e.preventDefault();
+			const dir = e.key === 'ArrowRight' ? 1 : -1;
+			setStopOffset(idx, colorStops[idx].offset + dir * step);
+		} else if (e.key === 'Home') {
+			e.preventDefault();
+			setStopOffset(idx, 0);
+		} else if (e.key === 'End') {
+			e.preventDefault();
+			setStopOffset(idx, 1);
+		} else if (e.key === 'Delete' || e.key === 'Backspace') {
+			e.preventDefault();
+			removeStop(idx);
 		}
-		colorStops.push({ offset, color });
-		selectedStop = colorStops.length - 1;
+	}
+	function onBarPointerUp(e: PointerEvent) {
+		if (e.target !== e.currentTarget) return;
+		if (e.pointerType === 'mouse' && e.button !== 0) return;
+		addStopAt(offsetFromX(e.clientX));
 	}
 
-	// ---- Code-tab — algorithm view-source ----
 	function num(n: number): string {
 		const r = Math.round(n * 1e4) / 1e4;
 		return Number.isInteger(r) ? String(r) : r.toString();
@@ -358,9 +445,12 @@
 			gradientCurve, gradientContrast,
 			tintAmount, tintSaturation, tintLightness, tintHueOffset, tintHueRange,
 			backgroundColor,
-			colorStops, noiseLayers, currents, emitters, occluders
+			colorStops, noiseLayers,
+			currents: withoutId(currents),
+			emitters: withoutId(emitters),
+			occluders: withoutId(occluders)
 		};
-		const fmtParams = JSON.stringify(params, (_k, v) => typeof v === 'number' ? +num(v) : v, 2);
+		const fmtParams = JSON.stringify(params, (_k, v) => (typeof v === 'number' ? +num(v) : v), 2);
 		return `// CellWave Fluid — algorithm snapshot
 // Generated from cellwaveGPU · github.com/newjordan/cellwaveGPU
 //
@@ -394,358 +484,485 @@ const UPDATE_FRAG = \`${dedent(UPDATE_FRAG_SOURCE)}\`;
 const RENDER_FRAG = \`${dedent(RENDER_FRAG_SOURCE)}\`;`;
 	});
 
-	let copied = $state(false);
+	let copyState = $state<'idle' | 'copied' | 'failed'>('idle');
+	let copyTimer: ReturnType<typeof setTimeout> | undefined;
+	const copyLabel = $derived(
+		copyState === 'copied' ? 'Copied' : copyState === 'failed' ? 'Copy failed' : 'Copy'
+	);
+	const copyStatus = $derived(
+		copyState === 'copied'
+			? 'Algorithm snapshot copied to the clipboard.'
+			: copyState === 'failed'
+				? 'Could not copy. Select the code and copy it manually.'
+				: ''
+	);
 	async function copyUsage() {
-		await navigator.clipboard.writeText(usage);
-		copied = true;
-		setTimeout(() => (copied = false), 1500);
+		try {
+			await navigator.clipboard.writeText(usage);
+			copyState = 'copied';
+		} catch {
+			const area = document.querySelector('textarea.code');
+			if (area instanceof HTMLTextAreaElement) {
+				area.focus();
+				area.select();
+				copyState = document.execCommand('copy') ? 'copied' : 'failed';
+			} else {
+				copyState = 'failed';
+			}
+		}
+		if (copyTimer) clearTimeout(copyTimer);
+		copyTimer = setTimeout(() => (copyState = 'idle'), 2000);
 	}
+
+	function onTabListKeydown(e: KeyboardEvent) {
+		const tabs: TabId[] = ['controls', 'code'];
+		const index = Math.max(0, tabs.indexOf(activeTab));
+		let next = index;
+		if (e.key === 'ArrowRight') next = (index + 1) % tabs.length;
+		else if (e.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length;
+		else if (e.key === 'Home') next = 0;
+		else if (e.key === 'End') next = tabs.length - 1;
+		else return;
+		e.preventDefault();
+		activeTab = tabs[next];
+		queueMicrotask(() => document.getElementById(`tab-${activeTab}`)?.focus());
+	}
+
+	function handleGpuUnavailable() {
+		gpuBlocked = true;
+	}
+
+	onMount(() => {
+		const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+		const syncMotion = () => {
+			prefersReducedMotion = motion.matches;
+			if (motion.matches) paused = true;
+		};
+		syncMotion();
+		motion.addEventListener('change', syncMotion);
+
+		let cancelled = false;
+		detectWebGPU().then((supported) => {
+			if (!cancelled) webgpuSupported = supported;
+		});
+
+		return () => {
+			cancelled = true;
+			motion.removeEventListener('change', syncMotion);
+			if (copyTimer) clearTimeout(copyTimer);
+		};
+	});
 </script>
 
-<div class="app">
-	<div class="hero">
-		<div class="canvas-wrap">
-			<CellWaveFluid
-				{gridSize}
-				{advection}
-				{diffusion}
-				{visScale}
-				{speed}
-				{backgroundColor}
-				{noiseLayers}
-				{colorStops}
-				{occluders}
-				{currents}
-				{emitters}
-				{tintAmount}
-				{tintSaturation}
-				{tintLightness}
-				{tintHueOffset}
-				{tintHueRange}
-				{gradientCurve}
-				{gradientContrast}
-			/>
-		</div>
+{#snippet rangeRow(
+	id: string,
+	label: string,
+	value: number,
+	min: number,
+	max: number,
+	step: number,
+	text: string,
+	commit: (next: number) => void,
+	disabled: boolean = false
+)}
+	<div class="row">
+		<label for={id}>{label}</label>
+		<input
+			{id}
+			type="range"
+			{min}
+			{max}
+			{step}
+			{value}
+			{disabled}
+			aria-valuetext={text}
+			oninput={(e) => commit(Number((e.currentTarget as HTMLInputElement).value))}
+		/>
+		<output class="value" for={id}>{text}</output>
 	</div>
+{/snippet}
 
-	<div class="head">
+<a class="skip" href="#playground-panels">Skip to controls</a>
+<main class="app">
+	<header class="head">
 		<div>
-			<div class="title">CellWave Fluid</div>
-			<div class="subtitle">GPU velocity-field simulation · live controls · paste-to-reproduce</div>
+			<h1 class="title">CellWave Fluid</h1>
+			<p class="subtitle">GPU velocity-field simulation with live controls and a paste-ready snapshot.</p>
 		</div>
-		<div class="tabs" role="tablist">
-			<button class="tab" role="tab" data-active={activeTab === 'controls'} onclick={() => (activeTab = 'controls')}>Controls</button>
-			<button class="tab" role="tab" data-active={activeTab === 'code'} onclick={() => (activeTab = 'code')}>Code</button>
-			<button class="tab" onclick={reset} title="Reset to defaults">Reset</button>
+		<div class="head-actions">
+			<div class="tabs" role="tablist" aria-label="Playground sections" tabindex="-1" onkeydown={onTabListKeydown}>
+				<button
+					type="button"
+					class="tab"
+					id="tab-controls"
+					role="tab"
+					aria-selected={activeTab === 'controls'}
+					aria-controls="panel-controls"
+					tabindex={activeTab === 'controls' ? 0 : -1}
+					onclick={() => (activeTab = 'controls')}
+				>Controls</button>
+				<button
+					type="button"
+					class="tab"
+					id="tab-code"
+					role="tab"
+					aria-selected={activeTab === 'code'}
+					aria-controls="panel-code"
+					tabindex={activeTab === 'code' ? 0 : -1}
+					onclick={() => (activeTab = 'code')}
+				>Code</button>
+			</div>
+			<button type="button" class="btn" onclick={reset}>Reset</button>
 		</div>
-	</div>
+	</header>
 
-	{#if activeTab === 'code'}
-		<div class="code">
-			<button class="copy" onclick={copyUsage}>{copied ? 'Copied' : 'Copy'}</button>{usage}</div>
-	{:else}
-		<div class="grid">
-			<div class="row-full section">Simulation</div>
-			<div class="row">
-				<label for="r-speed">Speed</label>
-				<input id="r-speed" type="range" min="0" max="3" step="0.05" bind:value={speed} />
-				<span class="value">{speed.toFixed(2)}</span>
-			</div>
-			<div class="row">
-				<label for="r-grid">Grid Size</label>
-				<input id="r-grid" type="range" min="20" max="200" step="1" bind:value={gridSize} />
-				<span class="value">{gridSize}</span>
-			</div>
-			<div class="row">
-				<label for="r-adv">Advection</label>
-				<input id="r-adv" type="range" min="0" max="1" step="0.01" bind:value={advection} />
-				<span class="value">{advection.toFixed(2)}</span>
-			</div>
-			<div class="row">
-				<label for="r-diff">Diffusion</label>
-				<input id="r-diff" type="range" min="0" max="0.4" step="0.005" bind:value={diffusion} />
-				<span class="value">{diffusion.toFixed(3)}</span>
-			</div>
-			<div class="row">
-				<label for="r-vis">Vis Scale</label>
-				<input id="r-vis" type="range" min="0.1" max="5" step="0.05" bind:value={visScale} />
-				<span class="value">{visScale.toFixed(2)}</span>
-			</div>
-
-			<div class="row-full section">Presets</div>
-			<div class="presets row-full">
-				{#each PRESETS as p (p.name)}
+	<section class="hero" aria-label="Simulation preview">
+		<div class="canvas-wrap">
+			{#if gpuBlocked}
+				<div class="gpu-fallback" role="alert">
+					{#if webgpuSupported === false}
+						<h2>WebGPU isn't supported in this browser</h2>
+						<p>
+							CellWave can't start the live simulation. This browser doesn't expose WebGPU, and a
+							WebGL2 canvas isn't available either. Use the latest Chrome, Edge, Firefox, or Safari
+							with hardware acceleration turned on, then reload.
+						</p>
+					{:else}
+						<h2>This browser couldn't start the GPU simulation</h2>
+						<p>
+							WebGL2 rendering isn't available, so the fluid preview can't run. Turn on hardware
+							acceleration, or open the playground in the latest Chrome, Edge, Firefox, or Safari,
+							then reload.
+						</p>
+					{/if}
+					<p><a href="https://caniuse.com/webgpu" rel="noreferrer">Browser support for WebGPU</a></p>
+				</div>
+			{:else}
+				<CellWaveFluid
+					{gridSize}
+					{advection}
+					{diffusion}
+					{visScale}
+					{speed}
+					{backgroundColor}
+					{noiseLayers}
+					{colorStops}
+					{occluders}
+					{currents}
+					{emitters}
+					{tintAmount}
+					{tintSaturation}
+					{tintLightness}
+					{tintHueOffset}
+					{tintHueRange}
+					{gradientCurve}
+					{gradientContrast}
+					{paused}
+					onUnavailable={handleGpuUnavailable}
+				/>
+				{#if webgpuSupported === false}
+					<p class="gpu-banner" role="status">
+						<strong>WebGPU isn't supported in this browser.</strong>
+						The preview is running through WebGL2 instead.
+						<a href="https://caniuse.com/webgpu" rel="noreferrer">See supported browsers</a>.
+					</p>
+				{/if}
+				<div class="canvas-toolbar">
+					{#if prefersReducedMotion && paused}
+						<span class="overlay-note">Paused for reduced motion</span>
+					{/if}
 					<button
 						type="button"
-						class="preset"
-						onclick={() => applyPreset(p)}
-						style:background={presetCss(p.stops)}
-						aria-label={`Apply ${p.name} gradient`}
-					>
-						<span class="preset-name">{p.name}</span>
-					</button>
-				{/each}
-			</div>
-
-			<div class="row-full section">Color &amp; Gradient</div>
-			<div class="row">
-				<label for="r-bg">Background</label>
-				<input id="r-bg" type="color" bind:value={backgroundColor} />
-			</div>
-
-			<div class="grad-row">
-				<div class="grad-hint">Drag to move · Click to select · Double-click to remove · Click bar to add</div>
-				<div
-					class="grad-bar"
-					bind:this={barEl}
-					onclick={onBarClick}
-					style:background={gradientCss}
-				>
-					{#each colorStops as stop, i (i)}
-						<button
-							type="button"
-							class="grad-handle"
-							data-selected={selectedStop === i}
-							style:left={`${stop.offset * 100}%`}
-							style:background={stop.color}
-							onpointerdown={(e) => onHandlePointerDown(e, i)}
-							onpointermove={(e) => onHandlePointerMove(e, i)}
-							onpointerup={(e) => onHandlePointerUp(e, i)}
-							onclick={(e) => e.stopPropagation()}
-							ondblclick={(e) => onHandleDoubleClick(e, i)}
-							aria-label={`Stop ${i + 1} at ${(stop.offset * 100).toFixed(0)}%, ${stop.color}`}
-						></button>
-					{/each}
-				</div>
-			</div>
-
-			{#if colorStops[selectedStop]}
-				<div class="row">
-					<label>Stop {selectedStop + 1} ({(colorStops[selectedStop].offset * 100).toFixed(0)}%)</label>
-					<input
-						type="color"
-						value={colorStops[selectedStop].color}
-						oninput={(e) => setStopColor(selectedStop, (e.currentTarget as HTMLInputElement).value)}
-					/>
+						class="overlay-btn"
+						aria-pressed={paused}
+						aria-label={paused ? 'Play simulation' : 'Pause simulation'}
+						onclick={() => (paused = !paused)}
+					>{paused ? 'Play' : 'Pause'}</button>
 				</div>
 			{/if}
-			<div class="row">
-				<label for="r-curve">Gradient Curve</label>
-				<input id="r-curve" type="range" min="0.25" max="4" step="0.05" bind:value={gradientCurve} />
-				<span class="value">{gradientCurve.toFixed(2)}</span>
-			</div>
-			<div class="row">
-				<label for="r-cont">Contrast</label>
-				<input id="r-cont" type="range" min="0" max="0.99" step="0.01" bind:value={gradientContrast} />
-				<span class="value">{gradientContrast.toFixed(2)}</span>
-			</div>
-
-			<div class="row-full section">Directional Tint</div>
-			<div class="row">
-				<label for="r-amt">Amount</label>
-				<input id="r-amt" type="range" min="0" max="1" step="0.05" bind:value={tintAmount} />
-				<span class="value">{tintAmount.toFixed(2)}</span>
-			</div>
-			<div class="row">
-				<label for="r-sat">Saturation</label>
-				<input id="r-sat" type="range" min="0" max="1" step="0.05" bind:value={tintSaturation} />
-				<span class="value">{tintSaturation.toFixed(2)}</span>
-			</div>
-			<div class="row">
-				<label for="r-light">Lightness</label>
-				<input id="r-light" type="range" min="0.1" max="0.9" step="0.05" bind:value={tintLightness} />
-				<span class="value">{tintLightness.toFixed(2)}</span>
-			</div>
-			<div class="row">
-				<label for="r-hoff">Hue Offset</label>
-				<input id="r-hoff" type="range" min="0" max="360" step="5" bind:value={tintHueOffset} />
-				<span class="value">{tintHueOffset}°</span>
-			</div>
-			<div class="row">
-				<label for="r-hrng">Hue Range</label>
-				<input id="r-hrng" type="range" min="0" max="360" step="5" bind:value={tintHueRange} />
-				<span class="value">{tintHueRange}°</span>
-			</div>
-
-			<div class="row-full section">Forces — Currents</div>
-			<div class="row row-full" style="justify-content: space-between">
-				<span class="grad-hint">{currents.length} / {MAX_FORCES} active</span>
-				<button class="btn" onclick={addCurrent} disabled={currents.length >= MAX_FORCES}>+ Add Current</button>
-			</div>
-			{#each currents as cur, i (i)}
-				<div class="row-full subsection" style="display: flex; justify-content: space-between; align-items: baseline">
-					<span>Current {i + 1}</span>
-					<button class="btn" onclick={() => currents.splice(i, 1)}>Remove</button>
-				</div>
-				<div class="row">
-					<label>Start X</label>
-					<input type="range" min="0" max={gridSize} step="0.5" value={cur.startX} oninput={(e) => setCurrent(i, 'startX', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.startX.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>Start Y</label>
-					<input type="range" min="0" max={gridSize} step="0.5" value={cur.startY} oninput={(e) => setCurrent(i, 'startY', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.startY.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>End X</label>
-					<input type="range" min="0" max={gridSize} step="0.5" value={cur.endX} oninput={(e) => setCurrent(i, 'endX', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.endX.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>End Y</label>
-					<input type="range" min="0" max={gridSize} step="0.5" value={cur.endY} oninput={(e) => setCurrent(i, 'endY', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.endY.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>Width</label>
-					<input type="range" min="1" max="40" step="0.5" value={cur.width} oninput={(e) => setCurrent(i, 'width', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.width.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>Strength</label>
-					<input type="range" min="0" max="3" step="0.05" value={cur.strength} oninput={(e) => setCurrent(i, 'strength', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.strength.toFixed(2)}</span>
-				</div>
-				<div class="row">
-					<label>Speed</label>
-					<input type="range" min="0" max="3" step="0.05" value={cur.speed} oninput={(e) => setCurrent(i, 'speed', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.speed.toFixed(2)}</span>
-				</div>
-				<div class="row">
-					<label>Taper</label>
-					<input type="range" min="0.5" max="5" step="0.1" value={cur.taper} oninput={(e) => setCurrent(i, 'taper', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{cur.taper.toFixed(1)}</span>
-				</div>
-			{/each}
-
-			<div class="row-full section">Forces — Emitters</div>
-			<div class="row row-full" style="justify-content: space-between">
-				<span class="grad-hint">{emitters.length} / {MAX_FORCES} active</span>
-				<button class="btn" onclick={addEmitter} disabled={emitters.length >= MAX_FORCES}>+ Add Emitter</button>
-			</div>
-			{#each emitters as em, i (i)}
-				<div class="row-full subsection" style="display: flex; justify-content: space-between; align-items: baseline">
-					<span>Emitter {i + 1}</span>
-					<button class="btn" onclick={() => emitters.splice(i, 1)}>Remove</button>
-				</div>
-				<div class="row">
-					<label>X</label>
-					<input type="range" min="0" max={gridSize} step="0.5" value={em.x} oninput={(e) => setEmitter(i, 'x', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.x.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>Y</label>
-					<input type="range" min="0" max={gridSize} step="0.5" value={em.y} oninput={(e) => setEmitter(i, 'y', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.y.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>Angle</label>
-					<input type="range" min="0" max="360" step="5" value={em.angle} oninput={(e) => setEmitter(i, 'angle', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.angle.toFixed(0)}°</span>
-				</div>
-				<div class="row">
-					<label>Length</label>
-					<input type="range" min="2" max={gridSize} step="0.5" value={em.length} oninput={(e) => setEmitter(i, 'length', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.length.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>Spread</label>
-					<input type="range" min="1" max="40" step="0.5" value={em.spread} oninput={(e) => setEmitter(i, 'spread', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.spread.toFixed(1)}</span>
-				</div>
-				<div class="row">
-					<label>Strength</label>
-					<input type="range" min="0" max="3" step="0.05" value={em.strength} oninput={(e) => setEmitter(i, 'strength', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.strength.toFixed(2)}</span>
-				</div>
-				<div class="row">
-					<label>Speed</label>
-					<input type="range" min="0" max="3" step="0.05" value={em.speed} oninput={(e) => setEmitter(i, 'speed', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.speed.toFixed(2)}</span>
-				</div>
-				<div class="row">
-					<label>Taper</label>
-					<input type="range" min="0.5" max="5" step="0.1" value={em.taper} oninput={(e) => setEmitter(i, 'taper', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{em.taper.toFixed(1)}</span>
-				</div>
-			{/each}
-
-			<div class="row-full section">Forces — Occluders</div>
-			<div class="row row-full" style="justify-content: space-between">
-				<span class="grad-hint">{occluders.length} / {MAX_FORCES} active · solid blocks that zero out velocity</span>
-				<button class="btn" onclick={addOccluder} disabled={occluders.length >= MAX_FORCES}>+ Add Occluder</button>
-			</div>
-			{#each occluders as occ, i (i)}
-				<div class="row-full subsection" style="display: flex; justify-content: space-between; align-items: baseline">
-					<span>Occluder {i + 1}</span>
-					<button class="btn" onclick={() => occluders.splice(i, 1)}>Remove</button>
-				</div>
-				<div class="row">
-					<label>X0</label>
-					<input type="range" min="0" max={gridSize} step="1" value={occ.x0} oninput={(e) => setOccluder(i, 'x0', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{occ.x0}</span>
-				</div>
-				<div class="row">
-					<label>Y0</label>
-					<input type="range" min="0" max={gridSize} step="1" value={occ.y0} oninput={(e) => setOccluder(i, 'y0', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{occ.y0}</span>
-				</div>
-				<div class="row">
-					<label>X1</label>
-					<input type="range" min="0" max={gridSize} step="1" value={occ.x1} oninput={(e) => setOccluder(i, 'x1', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{occ.x1}</span>
-				</div>
-				<div class="row">
-					<label>Y1</label>
-					<input type="range" min="0" max={gridSize} step="1" value={occ.y1} oninput={(e) => setOccluder(i, 'y1', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{occ.y1}</span>
-				</div>
-			{/each}
-
-			<div class="row-full section">Forcing Layers</div>
-			{#each noiseLayers as layer, i (i)}
-				<div class="row-full subsection">Layer {i + 1}</div>
-				<div class="row">
-					<label for={`l-en-${i}`}>Enabled</label>
-					<span class="switch">
-						<input id={`l-en-${i}`} type="checkbox" checked={layer.enabled} onchange={(e) => setLayer(i, 'enabled', (e.currentTarget as HTMLInputElement).checked)} />
-						<span class="track"></span>
-						<span class="knob"></span>
-					</span>
-				</div>
-				<div class="row">
-					<label for={`l-pat-${i}`}>Pattern</label>
-					<select id={`l-pat-${i}`} value={layer.pattern} onchange={(e) => setLayer(i, 'pattern', (e.currentTarget as HTMLSelectElement).value as NoiseLayer['pattern'])}>
-						<option value="simplex">Simplex</option>
-						<option value="wave">Wave</option>
-					</select>
-				</div>
-				<div class="row">
-					<label for={`l-sc-${i}`}>Scale</label>
-					<input id={`l-sc-${i}`} type="range" min="2" max="100" step="1" value={layer.scale} oninput={(e) => setLayer(i, 'scale', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{layer.scale}</span>
-				</div>
-				<div class="row">
-					<label for={`l-st-${i}`}>Strength</label>
-					<input id={`l-st-${i}`} type="range" min="0" max="2" step="0.05" value={layer.strength} oninput={(e) => setLayer(i, 'strength', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{layer.strength.toFixed(2)}</span>
-				</div>
-				<div class="row">
-					<label for={`l-sp-${i}`}>Speed</label>
-					<input id={`l-sp-${i}`} type="range" min="0" max="3" step="0.05" value={layer.speed} oninput={(e) => setLayer(i, 'speed', +(e.currentTarget as HTMLInputElement).value)} />
-					<span class="value">{layer.speed.toFixed(2)}</span>
-				</div>
-				<div class="row">
-					<label for={`l-an-${i}`}>Angle</label>
-					<input id={`l-an-${i}`} type="range" min="0" max="360" step="5" value={layer.angle ?? 0} oninput={(e) => setLayer(i, 'angle', +(e.currentTarget as HTMLInputElement).value)} disabled={layer.pattern !== 'wave'} />
-					<span class="value">{layer.angle ?? 0}°</span>
-				</div>
-			{/each}
 		</div>
-	{/if}
+	</section>
 
-	<div class="foot">
-		Algorithm: GPU velocity-field fluid sim (advection + 4-neighbor Laplacian + layered simplex/wave forcing).
+	<div id="playground-panels">
+		<div
+			class="tab-panel"
+			id="panel-controls"
+			role="tabpanel"
+			aria-labelledby="tab-controls"
+			hidden={activeTab !== 'controls'}
+		>
+			<div class="grid">
+				<h2 class="row-full section">Simulation</h2>
+				<div class="row">
+					<label for="r-speed">Speed</label>
+					<input id="r-speed" type="range" min="0" max="3" step="0.05" bind:value={speed} aria-valuetext={speed.toFixed(2)} />
+					<output class="value" for="r-speed">{speed.toFixed(2)}</output>
+				</div>
+				<div class="row">
+					<label for="r-grid">Grid size</label>
+					<input id="r-grid" type="range" min="20" max="200" step="1" bind:value={gridSize} aria-valuetext={String(gridSize)} />
+					<output class="value" for="r-grid">{gridSize}</output>
+				</div>
+				<div class="row">
+					<label for="r-adv">Advection</label>
+					<input id="r-adv" type="range" min="0" max="1" step="0.01" bind:value={advection} aria-valuetext={advection.toFixed(2)} />
+					<output class="value" for="r-adv">{advection.toFixed(2)}</output>
+				</div>
+				<div class="row">
+					<label for="r-diff">Diffusion</label>
+					<input id="r-diff" type="range" min="0" max="0.4" step="0.005" bind:value={diffusion} aria-valuetext={diffusion.toFixed(3)} />
+					<output class="value" for="r-diff">{diffusion.toFixed(3)}</output>
+				</div>
+				<div class="row">
+					<label for="r-vis">Vis scale</label>
+					<input id="r-vis" type="range" min="0.1" max="5" step="0.05" bind:value={visScale} aria-valuetext={visScale.toFixed(2)} />
+					<output class="value" for="r-vis">{visScale.toFixed(2)}</output>
+				</div>
+
+				<h2 class="row-full section">Presets</h2>
+				<div class="presets row-full" role="group" aria-label="Color presets">
+					{#each PRESETS as p (p.name)}
+						<button
+							type="button"
+							class="preset"
+							aria-pressed={activePreset === p.name}
+							onclick={() => applyPreset(p)}
+							style:background={presetCss(p.stops)}
+						>
+							<span class="preset-name">{p.name}</span>
+						</button>
+					{/each}
+				</div>
+
+				<h2 class="row-full section">Color and gradient</h2>
+				<div class="row">
+					<label for="r-bg">Background</label>
+					<input id="r-bg" type="color" bind:value={backgroundColor} />
+				</div>
+
+				<div class="grad-row">
+					<div class="grad-toolbar">
+						<p id="grad-hint" class="hint">
+							Drag a stop to move it. Focus a stop and use the arrow keys. Click the bar or Add stop to insert one.
+						</p>
+						<button
+							type="button"
+							class="btn"
+							onclick={addStopInLargestGap}
+							disabled={colorStops.length >= MAX_STOPS}
+						>Add stop</button>
+					</div>
+					<div
+						class="grad-bar"
+						role="group"
+						aria-label="Gradient stops"
+						aria-describedby="grad-hint"
+						bind:this={barEl}
+						onpointerup={onBarPointerUp}
+						style:background={gradientCss}
+					>
+						{#each colorStops as stop, i (i)}
+							<button
+								type="button"
+								class="grad-handle"
+								role="slider"
+								data-selected={selectedStop === i}
+								style:left={`${stop.offset * 100}%`}
+								style:background={stop.color}
+								aria-label={`Gradient stop ${i + 1}`}
+								aria-orientation="horizontal"
+								aria-valuemin={0}
+								aria-valuemax={100}
+								aria-valuenow={Math.round(stop.offset * 100)}
+								aria-valuetext={`${Math.round(stop.offset * 100)} percent, ${stop.color}`}
+								onpointerdown={(e) => onHandlePointerDown(e, i)}
+								onpointermove={(e) => onHandlePointerMove(e, i)}
+								onpointerup={(e) => onHandlePointerUp(e, i)}
+								onpointercancel={(e) => onHandlePointerUp(e, i)}
+								onkeydown={(e) => onHandleKeydown(e, i)}
+								ondblclick={(e) => onHandleDoubleClick(e, i)}
+								onfocus={() => (selectedStop = i)}
+							></button>
+						{/each}
+					</div>
+				</div>
+
+				{#if colorStops[selectedStop]}
+					<div class="row">
+						<label for="stop-color">Stop {selectedStop + 1} color ({(colorStops[selectedStop].offset * 100).toFixed(0)}%)</label>
+						<input
+							id="stop-color"
+							type="color"
+							value={colorStops[selectedStop].color}
+							oninput={(e) => setStopColor(selectedStop, (e.currentTarget as HTMLInputElement).value)}
+						/>
+						<button
+							type="button"
+							class="btn"
+							onclick={() => removeStop(selectedStop)}
+							disabled={colorStops.length <= 2}
+						>Remove stop</button>
+					</div>
+				{/if}
+				<div class="row">
+					<label for="r-curve">Gradient curve</label>
+					<input id="r-curve" type="range" min="0.25" max="4" step="0.05" bind:value={gradientCurve} aria-valuetext={gradientCurve.toFixed(2)} />
+					<output class="value" for="r-curve">{gradientCurve.toFixed(2)}</output>
+				</div>
+				<div class="row">
+					<label for="r-cont">Contrast</label>
+					<input id="r-cont" type="range" min="0" max="0.99" step="0.01" bind:value={gradientContrast} aria-valuetext={gradientContrast.toFixed(2)} />
+					<output class="value" for="r-cont">{gradientContrast.toFixed(2)}</output>
+				</div>
+
+				<h2 class="row-full section">Directional tint</h2>
+				<p class="hint row-full tight">Blends a hue taken from the flow direction into the speed gradient.</p>
+				<div class="row">
+					<label for="r-amt">Amount</label>
+					<input id="r-amt" type="range" min="0" max="1" step="0.05" bind:value={tintAmount} aria-valuetext={tintAmount.toFixed(2)} />
+					<output class="value" for="r-amt">{tintAmount.toFixed(2)}</output>
+				</div>
+				<div class="row">
+					<label for="r-sat">Saturation</label>
+					<input id="r-sat" type="range" min="0" max="1" step="0.05" bind:value={tintSaturation} aria-valuetext={tintSaturation.toFixed(2)} />
+					<output class="value" for="r-sat">{tintSaturation.toFixed(2)}</output>
+				</div>
+				<div class="row">
+					<label for="r-light">Lightness</label>
+					<input id="r-light" type="range" min="0.1" max="0.9" step="0.05" bind:value={tintLightness} aria-valuetext={tintLightness.toFixed(2)} />
+					<output class="value" for="r-light">{tintLightness.toFixed(2)}</output>
+				</div>
+				<div class="row">
+					<label for="r-hoff">Hue offset</label>
+					<input id="r-hoff" type="range" min="0" max="360" step="5" bind:value={tintHueOffset} aria-valuetext={`${tintHueOffset} degrees`} />
+					<output class="value" for="r-hoff">{tintHueOffset}°</output>
+				</div>
+				<div class="row">
+					<label for="r-hrng">Hue range</label>
+					<input id="r-hrng" type="range" min="0" max="360" step="5" bind:value={tintHueRange} aria-valuetext={`${tintHueRange} degrees`} />
+					<output class="value" for="r-hrng">{tintHueRange}°</output>
+				</div>
+
+				<div class="section-row">
+					<h2 class="section" id="currents-heading">Forces — currents</h2>
+					<button type="button" class="btn" onclick={addCurrent} disabled={currents.length >= MAX_FORCES} aria-describedby="currents-count">Add current</button>
+				</div>
+				<p class="hint row-full tight" id="currents-count">{currents.length} of {MAX_FORCES} active. A current is a directional force between two points.</p>
+				{#each currents as cur, i (cur.id)}
+					<fieldset class="force-card" aria-labelledby={`current-title-${cur.id}`}>
+						<div class="force-head">
+							<h3 id={`current-title-${cur.id}`}>Current {i + 1}</h3>
+							<button type="button" class="btn" aria-label={`Remove current ${i + 1}`} onclick={() => removeCurrent(cur.id)}>Remove</button>
+						</div>
+						{@render rangeRow(`cur-${cur.id}-sx`, 'Start X', cur.startX, 0, gridSize, 0.5, cur.startX.toFixed(1), (v) => setCurrent(i, 'startX', v))}
+						{@render rangeRow(`cur-${cur.id}-sy`, 'Start Y', cur.startY, 0, gridSize, 0.5, cur.startY.toFixed(1), (v) => setCurrent(i, 'startY', v))}
+						{@render rangeRow(`cur-${cur.id}-ex`, 'End X', cur.endX, 0, gridSize, 0.5, cur.endX.toFixed(1), (v) => setCurrent(i, 'endX', v))}
+						{@render rangeRow(`cur-${cur.id}-ey`, 'End Y', cur.endY, 0, gridSize, 0.5, cur.endY.toFixed(1), (v) => setCurrent(i, 'endY', v))}
+						{@render rangeRow(`cur-${cur.id}-w`, 'Width', cur.width, 1, 40, 0.5, cur.width.toFixed(1), (v) => setCurrent(i, 'width', v))}
+						{@render rangeRow(`cur-${cur.id}-st`, 'Strength', cur.strength, 0, 3, 0.05, cur.strength.toFixed(2), (v) => setCurrent(i, 'strength', v))}
+						{@render rangeRow(`cur-${cur.id}-sp`, 'Speed', cur.speed, 0, 3, 0.05, cur.speed.toFixed(2), (v) => setCurrent(i, 'speed', v))}
+						{@render rangeRow(`cur-${cur.id}-tp`, 'Taper', cur.taper, 0.5, 5, 0.1, cur.taper.toFixed(1), (v) => setCurrent(i, 'taper', v))}
+					</fieldset>
+				{/each}
+
+				<div class="section-row">
+					<h2 class="section" id="emitters-heading">Forces — emitters</h2>
+					<button type="button" class="btn" onclick={addEmitter} disabled={emitters.length >= MAX_FORCES} aria-describedby="emitters-count">Add emitter</button>
+				</div>
+				<p class="hint row-full tight" id="emitters-count">{emitters.length} of {MAX_FORCES} active. An emitter is a cone-shaped fan.</p>
+				{#each emitters as em, i (em.id)}
+					<fieldset class="force-card" aria-labelledby={`emitter-title-${em.id}`}>
+						<div class="force-head">
+							<h3 id={`emitter-title-${em.id}`}>Emitter {i + 1}</h3>
+							<button type="button" class="btn" aria-label={`Remove emitter ${i + 1}`} onclick={() => removeEmitter(em.id)}>Remove</button>
+						</div>
+						{@render rangeRow(`em-${em.id}-x`, 'X', em.x, 0, gridSize, 0.5, em.x.toFixed(1), (v) => setEmitter(i, 'x', v))}
+						{@render rangeRow(`em-${em.id}-y`, 'Y', em.y, 0, gridSize, 0.5, em.y.toFixed(1), (v) => setEmitter(i, 'y', v))}
+						{@render rangeRow(`em-${em.id}-a`, 'Angle', em.angle, 0, 360, 5, `${em.angle.toFixed(0)}°`, (v) => setEmitter(i, 'angle', v))}
+						{@render rangeRow(`em-${em.id}-l`, 'Length', em.length, 2, gridSize, 0.5, em.length.toFixed(1), (v) => setEmitter(i, 'length', v))}
+						{@render rangeRow(`em-${em.id}-s`, 'Spread', em.spread, 1, 40, 0.5, em.spread.toFixed(1), (v) => setEmitter(i, 'spread', v))}
+						{@render rangeRow(`em-${em.id}-st`, 'Strength', em.strength, 0, 3, 0.05, em.strength.toFixed(2), (v) => setEmitter(i, 'strength', v))}
+						{@render rangeRow(`em-${em.id}-sp`, 'Speed', em.speed, 0, 3, 0.05, em.speed.toFixed(2), (v) => setEmitter(i, 'speed', v))}
+						{@render rangeRow(`em-${em.id}-tp`, 'Taper', em.taper, 0.5, 5, 0.1, em.taper.toFixed(1), (v) => setEmitter(i, 'taper', v))}
+					</fieldset>
+				{/each}
+
+				<div class="section-row">
+					<h2 class="section" id="occluders-heading">Forces — occluders</h2>
+					<button type="button" class="btn" onclick={addOccluder} disabled={occluders.length >= MAX_FORCES} aria-describedby="occluders-count">Add occluder</button>
+				</div>
+				<p class="hint row-full tight" id="occluders-count">{occluders.length} of {MAX_FORCES} active. Solid blocks that zero out velocity.</p>
+				{#each occluders as occ, i (occ.id)}
+					<fieldset class="force-card" aria-labelledby={`occluder-title-${occ.id}`}>
+						<div class="force-head">
+							<h3 id={`occluder-title-${occ.id}`}>Occluder {i + 1}</h3>
+							<button type="button" class="btn" aria-label={`Remove occluder ${i + 1}`} onclick={() => removeOccluder(occ.id)}>Remove</button>
+						</div>
+						{@render rangeRow(`oc-${occ.id}-x0`, 'X0', occ.x0, 0, gridSize, 1, String(occ.x0), (v) => setOccluder(i, 'x0', v))}
+						{@render rangeRow(`oc-${occ.id}-y0`, 'Y0', occ.y0, 0, gridSize, 1, String(occ.y0), (v) => setOccluder(i, 'y0', v))}
+						{@render rangeRow(`oc-${occ.id}-x1`, 'X1', occ.x1, 0, gridSize, 1, String(occ.x1), (v) => setOccluder(i, 'x1', v))}
+						{@render rangeRow(`oc-${occ.id}-y1`, 'Y1', occ.y1, 0, gridSize, 1, String(occ.y1), (v) => setOccluder(i, 'y1', v))}
+					</fieldset>
+				{/each}
+
+				<h2 class="row-full section">Forcing layers</h2>
+				{#each noiseLayers as layer, i (i)}
+					<fieldset class="force-card" aria-labelledby={`layer-title-${i}`}>
+						<div class="force-head">
+							<h3 id={`layer-title-${i}`}>Layer {i + 1}</h3>
+						</div>
+						<div class="row">
+							<label for={`l-en-${i}`}>Enabled</label>
+							<span class="switch">
+								<input id={`l-en-${i}`} type="checkbox" role="switch" checked={layer.enabled} onchange={(e) => setLayer(i, 'enabled', (e.currentTarget as HTMLInputElement).checked)} />
+								<span class="track"></span>
+								<span class="knob"></span>
+							</span>
+						</div>
+						<div class="row">
+							<label for={`l-pat-${i}`}>Pattern</label>
+							<select id={`l-pat-${i}`} value={layer.pattern} onchange={(e) => setLayer(i, 'pattern', (e.currentTarget as HTMLSelectElement).value as NoiseLayer['pattern'])}>
+								<option value="simplex">Simplex</option>
+								<option value="wave">Wave</option>
+							</select>
+						</div>
+						{@render rangeRow(`l-sc-${i}`, 'Scale', layer.scale, 2, 100, 1, String(layer.scale), (v) => setLayer(i, 'scale', v))}
+						{@render rangeRow(`l-st-${i}`, 'Strength', layer.strength, 0, 2, 0.05, layer.strength.toFixed(2), (v) => setLayer(i, 'strength', v))}
+						{@render rangeRow(`l-sp-${i}`, 'Speed', layer.speed, 0, 3, 0.05, layer.speed.toFixed(2), (v) => setLayer(i, 'speed', v))}
+						{@render rangeRow(
+							`l-an-${i}`,
+							'Angle',
+							layer.angle ?? 0,
+							0,
+							360,
+							5,
+							`${layer.angle ?? 0}°`,
+							(v) => setLayer(i, 'angle', v),
+							layer.pattern !== 'wave'
+						)}
+					</fieldset>
+				{/each}
+			</div>
+		</div>
+
+		<div
+			class="tab-panel"
+			id="panel-code"
+			role="tabpanel"
+			aria-labelledby="tab-code"
+			hidden={activeTab !== 'code'}
+		>
+			<div class="code-toolbar">
+				<p class="hint">Algorithm snapshot for the controls on screen.</p>
+				<button type="button" class="btn" onclick={copyUsage}>{copyLabel}</button>
+			</div>
+			<textarea class="code" readonly aria-label="Algorithm snapshot" value={usage}></textarea>
+			<p class="sr-only" aria-live="polite">{copyStatus}</p>
+		</div>
 	</div>
-</div>
+
+	<footer class="foot">
+		<p>GPU velocity-field fluid simulation: advection, a 4-neighbor Laplacian, and layered simplex and wave forcing.</p>
+		<p><a href="https://github.com/newjordan/cellwaveGPU" rel="noreferrer">View source on GitHub</a></p>
+	</footer>
+</main>

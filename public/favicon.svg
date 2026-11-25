@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="CellWave">
+	<rect width="32" height="32" rx="8" fill="#0a0a0c"/>
+	<path d="M4 21c3.2-7 6.4-7 9.6 0s6.4 7 9.6 0 6.4-7 9.6 0" fill="none" stroke="#b4dcff" stroke-width="2" stroke-linecap="round"/>
+	<path d="M4 13c3.2-5.5 6.4-5.5 9.6 0s6.4 5.5 9.6 0 6.4-5.5 9.6 0" fill="none" stroke="#7eb6ff" stroke-width="2" stroke-linecap="round"/>
+</svg>

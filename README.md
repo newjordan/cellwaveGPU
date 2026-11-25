@@ -1,8 +1,14 @@
 # CellWave Playground
 
-A real-time, GPU-accelerated playground for the CellWave fluid algorithm — a velocity-field simulation with layered noise/wave forcing, directional currents, point emitters, and rect occluders. Mess with every parameter live, then copy a Svelte snippet that reproduces your exact state.
+**Live demo:** [https://cellwave-gpu.vercel.app](https://cellwave-gpu.vercel.app)
+
+![CellWave playground with the fluid preview, simulation controls, and color presets](docs/playground.png)
+
+A real-time, GPU-accelerated playground for the CellWave fluid algorithm — a velocity-field simulation with layered noise/wave forcing, directional currents, point emitters, and rect occluders. Mess with every parameter live, then copy the algorithm snapshot that reproduces your exact state.
 
 Single-page Vite + Svelte 5 app. The simulation runs on the GPU via OGL (WebGL2). Static-only build, deploys anywhere.
+
+If WebGPU isn't available, the preview says so and keeps running on WebGL2. If a WebGL2 context can't be created either, the canvas is replaced with a short message that explains how to turn on hardware acceleration in a current Chrome, Edge, Firefox, or Safari.
 
 ## Quick start
 
@@ -22,7 +28,7 @@ npm run preview  # serve the built output locally
 
 Static `dist/` folder. Drop into:
 
-- **Vercel**: import the repo; framework preset detects Vite automatically. Output dir: `dist`. Build command: `npm run build`.
+- **Vercel**: import the repo; framework preset detects Vite automatically. Output dir: `dist`. Build command: `npm run build`. The existing project does not need a new framework, output directory, or environment variable.
 - **Netlify**: build command `npm run build`, publish dir `dist`.
 - **Cloudflare Pages**: same.
 - **GitHub Pages**: `npm run build`, push `dist/` to `gh-pages` branch.
